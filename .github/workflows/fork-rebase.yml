@@ -1,0 +1,73 @@
+# The fork's daily rebase of main and every branch onto upstream main (.github/fork/rebase.py).
+# Upstream's workflows need Blacksmith runners and secrets the fork doesn't have, so this job
+# keeps them disabled. The push needs the REBASE_TOKEN secret, a token with the `workflow` scope:
+# GITHUB_TOKEN can't push commits that change workflow files, which upstream commits often do.
+name: Fork rebase
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-rebase
+
+jobs:
+  rebase:
+    name: Rebase onto upstream
+    if: github.repository == 'spikonado/solidcraft'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      issues: write
+      actions: write
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.REBASE_TOKEN }}
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: fork-rebase
+      - name: Rebase main and every branch
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python3 .github/fork/rebase.py
+      - name: Keep upstream's workflows disabled
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow list --all --json path,state --jq '.[] | select(.state == "active") | .path | select(endswith("/fork-rebase.yml") | not)' \
+            | xargs -r -n1 basename | xargs -r -n1 gh workflow disable
+      - name: Report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTCOME: ${{ job.status }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Daily rebase onto upstream failed"
+          open=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
+          if [ "$OUTCOME" = success ]; then
+            [ -z "$open" ] || gh issue close "$open" --comment "The rebase passes again: $RUN"
+            exit 0
+          fi
+          [ -s report.md ] || echo "The rebase job failed before it wrote a report." > report.md
+          printf '\nRun: %s\n' "$RUN" >> report.md
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body-file report.md
+          else
+            gh issue create --title "$title" --body-file report.md
+          fi
